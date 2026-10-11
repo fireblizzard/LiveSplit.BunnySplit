@@ -1,0 +1,75 @@
+name: Build DLL
+
+# Run by hand from the Actions tab. It builds whatever branch, tag or commit you
+# type in, so this file only has to live on the default branch, not on the branch
+# you're building.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build
+        required: true
+        default: fix-livesplit-hang
+
+permissions:
+  contents: read
+  id-token: write      # needed to sign the build attestation
+  attestations: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Download LiveSplit and .NET Framework 4.8.1 reference assemblies
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R LiveSplit/LiveSplit --pattern "*.zip" --dir deps
+          $zip = Get-ChildItem deps/*.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName deps/livesplit
+          $core = Get-ChildItem deps/livesplit -Recurse -Filter LiveSplit.Core.dll | Select-Object -First 1
+          if (-not $core) { throw "LiveSplit.Core.dll not found in $($zip.Name)" }
+          "LS_DIR=$($core.DirectoryName.Replace('\', '/'))/" >> $env:GITHUB_ENV
+
+          Invoke-WebRequest https://api.nuget.org/v3-flatcontainer/microsoft.netframework.referenceassemblies.net481/1.0.3/microsoft.netframework.referenceassemblies.net481.1.0.3.nupkg -OutFile deps/refasm.zip
+          Expand-Archive deps/refasm.zip deps/refasm
+          "REFASM_DIR=$((Resolve-Path deps/refasm/build).Path.Replace('\', '/'))/" >> $env:GITHUB_ENV
+
+      - name: Build
+        shell: pwsh
+        run: |
+          dotnet build LiveSplit.BunnySplit/LiveSplit.BunnySplit.csproj -c Release `
+            -p:TargetFrameworkVersion=v4.8.1 `
+            -p:PostBuildEvent= `
+            "-p:ReferencePath=$env:LS_DIR" `
+            "-p:TargetFrameworkRootPath=$env:REFASM_DIR"
+
+      - name: Record commit and checksum
+        id: info
+        shell: pwsh
+        run: |
+          $dll = "LiveSplit.BunnySplit/bin/Release/LiveSplit.BunnySplit.dll"
+          $commit = git rev-parse HEAD
+          $hash = (Get-FileHash $dll -Algorithm SHA256).Hash
+          "short=$($commit.Substring(0, 7))" >> $env:GITHUB_OUTPUT
+          @"
+          ## LiveSplit.BunnySplit.dll
+          - Built from: ``${{ inputs.ref }}`` at commit ``$commit``
+          - SHA-256: ``$hash``
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: LiveSplit.BunnySplit/bin/Release/LiveSplit.BunnySplit.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiveSplit.BunnySplit-${{ steps.info.outputs.short }}
+          path: LiveSplit.BunnySplit/bin/Release/LiveSplit.BunnySplit.dll
+
