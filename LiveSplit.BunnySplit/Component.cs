@@ -9,7 +9,6 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Collections.Generic;
 
 namespace LiveSplit.BunnySplit
@@ -60,13 +59,9 @@ namespace LiveSplit.BunnySplit
         }
 
         private ComponentSettings settings = new ComponentSettings();
-        private NamedPipeClientStream pipe = new NamedPipeClientStream(
-            ".",
-            PIPE_NAME,
-            PipeAccessRights.ReadData | PipeAccessRights.WriteAttributes,
-            PipeOptions.None,
-            System.Security.Principal.TokenImpersonationLevel.None,
-            System.IO.HandleInheritability.None);
+        private NamedPipeClientStream pipe;
+        private object pipeLock = new object();
+        private LiveSplitState state;
         private CancellationTokenSource cts = new CancellationTokenSource();
         private Thread pipeThread;
         private TimerModel model;
@@ -81,17 +76,31 @@ namespace LiveSplit.BunnySplit
 
         public Component(LiveSplitState state)
         {
+            this.state = state;
             state.OnStart += OnStart;
             model = new TimerModel() { CurrentState = state };
             model.InitializeGameTime();
-            pipeThread = new Thread(PipeThreadFunc);
+            pipeThread = new Thread(PipeThreadFunc) { IsBackground = true, Name = "BunnySplit pipe" };
             pipeThread.Start();
         }
 
         public override void Dispose()
         {
+            state.OnStart -= OnStart;
             cts.Cancel();
-            pipeThread.Join();
+
+            // BXT only writes while its timer runs, so a read can stay blocked for as long as the
+            // game sits in the menu, for example. Waiting for the pipe thread to finish that read
+            // would freeze LiveSplit whenever the component is disposed, like when hitting cancel
+            // on the Edit splits window. Closing the pipe here cancels the read so the thread exits
+            // right away and LiveSplit doesn't hang.
+            lock (pipeLock)
+            {
+                pipe?.Dispose();
+            }
+
+            if (!pipeThread.Join(TimeSpan.FromSeconds(1)))
+                Debug.WriteLine("The BunnySplit pipe thread did not stop in time. Leaving it to exit on its own.");
         }
 
         public override XmlNode GetSettings(XmlDocument document)
@@ -290,74 +299,90 @@ namespace LiveSplit.BunnySplit
 
         private void PipeThreadFunc()
         {
+            var buf = new byte[256];
+
             while (!cts.IsCancellationRequested)
             {
-                if (!pipe.IsConnected)
-                {
-                    Debug.WriteLine("Connecting to the pipe.");
-                    try
-                    {
-                        pipe.Connect(0);
-                        Debug.WriteLine("Connected to the pipe. Readmode: " + pipe.ReadMode);
-                        pipe.ReadMode = PipeTransmissionMode.Message;
-                        Debug.WriteLine("Set the message read mode.");
-                    }
-                    catch (Exception e) when (e is TimeoutException || e is IOException)
-                    {
-                        Debug.WriteLine("Idling for 1 second.");
-                        cts.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(1));
-                        continue;
-                    }
-                }
+                // Use a new client for every connection attempt instead of reconnecting one whose pipe already broke.
+                // It is asynchronous so that closing it from Dispose cancels a pending read.
+                var client = new NamedPipeClientStream(
+                    ".",
+                    PIPE_NAME,
+                    PipeAccessRights.ReadData | PipeAccessRights.WriteAttributes,
+                    PipeOptions.Asynchronous,
+                    System.Security.Principal.TokenImpersonationLevel.None,
+                    System.IO.HandleInheritability.None);
 
-                // Connected to the pipe.
+                Debug.WriteLine("Connecting to the pipe.");
                 try
                 {
-                    var buf = new byte[256];
-                    var task = pipe.ReadAsync(buf, 0, 256, cts.Token);
-                    task.Wait();
-
-                    if (task.Result == 0)
-                    {
-                        // The pipe was closed.
-                        Debug.WriteLine("Pipe end of stream reached.");
-                        continue;
-                    }
-
-                    if (buf[0] != task.Result)
-                    {
-                        Debug.WriteLine("Received an incorrect number of bytes (" + task.Result + ", expected " + buf[0] + ").");
-                        continue;
-                    }
-
-                    ParseMessage(buf);
+                    client.Connect(0);
+                    client.ReadMode = PipeTransmissionMode.Message;
+                    Debug.WriteLine("Connected to the pipe.");
                 }
-                catch (AggregateException e)
+                catch (Exception e) when (e is TimeoutException || e is IOException || e is UnauthorizedAccessException)
                 {
-                    foreach (var ex in e.InnerExceptions)
-                    {
-                        if (ex is TaskCanceledException)
-                        {
-                            return;
-                        }
-                    }
-
-                    Debug.WriteLine("Error reading from the pipe:");
-                    foreach (var ex in e.InnerExceptions)
-                    {
-                        Debug.WriteLine("- " + ex.GetType().Name + ": " + ex.Message);
-                    }
+                    client.Dispose();
                     Debug.WriteLine("Idling for 1 second.");
                     cts.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(1));
                     continue;
+                }
+
+                lock (pipeLock)
+                {
+                    if (cts.IsCancellationRequested)
+                    {
+                        client.Dispose();
+                        return;
+                    }
+                    pipe = client;
+                }
+
+                try
+                {
+                    ReadMessages(client, buf);
                 }
                 catch (Exception e)
                 {
-                    Debug.WriteLine("Error reading from the pipe: " + e.Message);
-                    Debug.WriteLine("Idling for 1 second.");
-                    cts.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(1));
+                    // Dispose closed the pipe to stop the read, so this error is expected.
+                    if (cts.IsCancellationRequested)
+                        return;
+                    Debug.WriteLine("Error reading from the pipe: " + e.GetType().Name + ": " + e.Message);
+                }
+                finally
+                {
+                    lock (pipeLock)
+                    {
+                        pipe = null;
+                    }
+                    client.Dispose();
+                }
+
+                Debug.WriteLine("Idling for 1 second.");
+                cts.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(1));
+            }
+        }
+
+        private void ReadMessages(NamedPipeClientStream client, byte[] buf)
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                var read = client.Read(buf, 0, buf.Length);
+
+                if (read == 0)
+                {
+                    // The pipe was closed.
+                    Debug.WriteLine("Pipe end of stream reached.");
+                    return;
+                }
+
+                if (buf[0] != read)
+                {
+                    Debug.WriteLine("Received an incorrect number of bytes (" + read + ", expected " + buf[0] + ").");
                     continue;
                 }
+
+                ParseMessage(buf);
             }
         }
     }
